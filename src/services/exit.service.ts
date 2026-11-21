@@ -19,6 +19,13 @@ import { nowMs } from '../lib/clock';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { cancelPositionPredicates } from './hedge-predicate.service';
+import {
+  classifyLiquidityBucket,
+  markExecutionReportOutcome,
+  recordExecutionQuoteAttempt,
+} from './execution-quality.service';
+import { priceYesBps } from '../generated/fpmm';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import { CONTRACTS } from '../config/contracts';
@@ -308,6 +315,11 @@ async function applyConfirmedExit(
     const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
     return { closed: current != null && current.status !== 'OPEN', applied: false };
   }
+  if (result.closed) {
+    await cancelPositionPredicates(position.id).catch((err) => {
+      logger.warn({ err, positionId: position.id }, 'Failed to cancel predicates on closed position');
+    });
+  }
   return { closed: result.closed, applied: true };
 }
 
@@ -494,6 +506,7 @@ export async function exitPosition(
     if (target <= 0n) return failed('EXIT_NO_SHARES', { error: `recorded ${recorded}, on-chain ${held}` });
 
     let plan: ExitPlan;
+    let exitMarket: OnChainMarket;
     try {
       let market = await getOnChainMarket(onChainMarketId);
       ({ plan } = await planBreakerSafeExit(onChainMarketId, market, outcome, target, EXIT_SLIPPAGE_BPS, held));
@@ -503,6 +516,7 @@ export async function exitPosition(
         market = await getOnChainMarket(onChainMarketId);
         ({ plan } = await planBreakerSafeExit(onChainMarketId, market, outcome, target, EXIT_SLIPPAGE_BPS, held));
       }
+      exitMarket = market;
     } catch (err) {
       if (err instanceof ExitError) return failed(err.code, { error: err.message });
       const kind = classify(err);
@@ -520,6 +534,28 @@ export async function exitPosition(
       },
     });
 
+    const exitResYes = BigInt(exitMarket.reserve_yes);
+    const exitResNo = BigInt(exitMarket.reserve_no);
+    const exitYesMidBps = exitResYes > 0n && exitResNo > 0n ? Number(priceYesBps(exitResYes, exitResNo)) : null;
+    const exitQuoteMidBps = exitYesMidBps === null ? null : (outcome === 'YES' ? exitYesMidBps : 10_000 - exitYesMidBps);
+    await recordExecutionQuoteAttempt({
+      kind: 'SELL',
+      positionExitId: row.id,
+      marketId: position.marketId,
+      direction: outcome,
+      decisionMidBps: position.markPriceBps ?? null,
+      slippageBoundBps: Number(EXIT_SLIPPAGE_BPS),
+      liquidityBucket: classifyLiquidityBucket(exitResYes, exitResNo),
+      quote: {
+        attempt: 1,
+        quotedAt: new Date().toISOString(),
+        quoteMidBps: exitQuoteMidBps,
+        quotedOutRaw: plan.quotedSharesIn.toString(),
+        boundRaw: plan.maxSharesIn.toString(),
+        quotedPriceBps: priceBpsFromRaw(plan.collateralOut, plan.quotedSharesIn),
+      },
+    });
+
     try {
       const result = await agentSell(
         {
@@ -531,6 +567,13 @@ export async function exitPosition(
         undefined,
         { kind: 'trade.sell', refId: row.id },
       );
+      if (result.txHash) {
+        await markExecutionReportOutcome({
+          positionExitId: row.id,
+          status: 'PENDING',
+          landedTxHash: result.txHash,
+        });
+      }
       const sold = BigInt(result.value);
 
       if (result.mode === 'dry-run') {
@@ -589,6 +632,11 @@ export async function exitPosition(
 
       const code = FAILURE_CODES[kind];
       await prisma.positionExit.update({ where: { id: row.id }, data: { status: 'FAILED', error: `${code}: ${errorText(err)}` } });
+      await markExecutionReportOutcome({
+        positionExitId: row.id,
+        status: kind === 'slippage' ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+        failureCode: kind === 'slippage' ? 'SlippageExceeded' : code,
+      });
 
       if (kind === 'slippage' && slippageRetries < MAX_SLIPPAGE_RETRIES) {
         slippageRetries++;

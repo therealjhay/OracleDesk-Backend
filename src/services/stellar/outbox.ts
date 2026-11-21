@@ -26,6 +26,7 @@
 import { Keypair, Transaction, TransactionBuilder, rpc } from '@stellar/stellar-sdk';
 import type { Prisma } from '@prisma/client';
 import { config } from '../../config';
+import { getChainCache } from '../../lib/chain-cache';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { RedisUnavailableError, getRedis, releaseLock, renewLock } from '../../lib/redis';
@@ -181,7 +182,99 @@ export interface CompletionOutcome {
   /** Native return value for SUCCESS (e.g. the on-chain market id or shares). */
   value?: unknown;
   txHash?: string | null;
+  ledger?: number | null;
   error?: string | null;
+}
+
+// ─── Write intents & confirmation invalidation (#330) ────────────────────────
+
+const WRITE_INTENT_MARGIN_MS = 15_000;
+const rowIntents = new Map<string, string>();
+
+/** TTL for write intents: inline wait window plus a safety margin. */
+export function writeIntentTtlMs(): number {
+  return config.OUTBOX_INLINE_WAIT_MS + WRITE_INTENT_MARGIN_MS;
+}
+
+function rowArgsObject(args: unknown): Record<string, unknown> {
+  return args && typeof args === 'object' && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Registers a chain-cache write intent for an outbox row once its envelope is
+ * signed and before sendTransaction. Returns the intent token, or null when the
+ * write affects no cached tags.
+ */
+export async function beginWriteIntentForRow(
+  rowId: string,
+  method: string,
+  args: Record<string, unknown>,
+  ttlMs = writeIntentTtlMs(),
+): Promise<string | null> {
+  const tags = tagsForWrite(method, args);
+  if (tags.length === 0) return null;
+  await endWriteIntentForRow(rowId);
+  try {
+    const token = await getChainCache().beginWrite(tags, ttlMs);
+    rowIntents.set(rowId, token);
+    return token;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId, method }, 'outbox: failed to begin write intent');
+    return null;
+  }
+}
+
+/** Ends any active write intent tracked for an outbox row. Idempotent. */
+export async function endWriteIntentForRow(rowId: string): Promise<void> {
+  const token = rowIntents.get(rowId);
+  if (!token) return;
+  rowIntents.delete(rowId);
+  try {
+    await getChainCache().endWrite(token);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId }, 'outbox: failed to end write intent');
+  }
+}
+
+/** Extends the write intent while a row remains PENDING during recovery. */
+async function refreshWriteIntentForRow(row: ChainTransactionRow): Promise<void> {
+  if (!row.method) return;
+  await beginWriteIntentForRow(row.id, row.method, rowArgsObject(row.args));
+}
+
+/**
+ * Confirmation hook (#330): invalidates every chain-read cache tag affected by
+ * a confirmed write at its landing ledger, then clears the row's write intent.
+ *
+ * Called for SUCCESS and for FAILED transactions that landed on-chain with a
+ * txHash (a failed transaction still consumed fees and may have altered state
+ * via a fee-bump). Runs after commit (#290).
+ */
+export async function onConfirmed(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+  const shouldInvalidate =
+    outcome.status === 'SUCCESS' ||
+    (outcome.status === 'FAILED' && Boolean(outcome.txHash ?? row.landedHash));
+
+  try {
+    if (shouldInvalidate && row.method) {
+      const returned = outcome.status === 'SUCCESS' ? (outcome.value ?? row.returnValue) : undefined;
+      const tags = tagsForWrite(row.method, rowArgsObject(row.args), returned);
+      const rawLedger = row.ledger ?? outcome.ledger;
+      const atLedger = typeof rawLedger === 'number' && Number.isFinite(rawLedger) && rawLedger > 0
+        ? rawLedger
+        : undefined;
+      if (tags.length > 0) {
+        const cache = getChainCache();
+        await Promise.all(tags.map((tag) => cache.invalidateTag(tag, atLedger)));
+      }
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id, method: row.method }, 'outbox: cache invalidation failed');
+  } finally {
+    await endWriteIntentForRow(row.id);
+  }
 }
 
 export interface CompletionContext {
@@ -268,6 +361,7 @@ export async function completeOutboxRow(
           afterCommit: (fn) => { hooks.push(fn); },
         };
         if (handler) await handler(row!, outcome, noopCtx);
+        await onConfirmed(row!, outcome);
         await opts.store!.markHandled(row!.id);
       });
     }
@@ -276,6 +370,7 @@ export async function completeOutboxRow(
   }
 
   const kindHint = typeof rowOrId === 'string' ? 'unknown' : rowOrId.kind;
+  let effectiveOutcomeForPostCommit = outcome;
   const committed = await trackHandlerRun(kindHint, async () => {
     return prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<ChainTransactionRow[]>`
@@ -301,6 +396,7 @@ export async function completeOutboxRow(
           return null;
         }
       }
+      effectiveOutcomeForPostCommit = effectiveOutcome;
 
       if (opts.landedHash) {
         await applyLandedHash(locked, opts.landedHash, tx);
@@ -328,14 +424,15 @@ export async function completeOutboxRow(
   });
 
   if (committed) {
+    await onConfirmed(committed, effectiveOutcomeForPostCommit);
     await runPostCommitHooks(hooks);
   }
   return committed;
 }
 
 /**
- * Runs the kind's handler and marks the row handled atomically in one
- * Postgres transaction with `SELECT ... FOR UPDATE` (#290).
+ * Runs the kind's handler, invalidates affected chain-cache tags, and marks
+ * the row handled atomically in one Postgres transaction with `SELECT ... FOR UPDATE` (#290, #330).
  */
 export async function runCompletionHandler(
   row: ChainTransactionRow,
@@ -718,9 +815,9 @@ export async function recoverRow(
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
       const moved = await completeOutboxRow(
         row,
-        { status: 'FAILED', error, txHash: landed.hash },
+        { status: 'FAILED', error, txHash: landed.hash, ledger: anyResp.ledger ?? row.ledger },
         {
-          transition: { from: [...IN_FLIGHT], to: 'FAILED', patch: { landedHash: landed.hash, error } },
+          transition: { from: [...IN_FLIGHT], to: 'FAILED', patch: { landedHash: landed.hash, ledger: anyResp.ledger ?? null, error } },
           store: deps.store,
         },
       );
@@ -753,6 +850,11 @@ export async function recoverRow(
       stats.handled++;
     }
     return stats;
+  }
+
+  // Row is still in-flight: extend its write intent while pending (#330).
+  if (row.status === 'PENDING' || row.status === 'SUBMITTED') {
+    await refreshWriteIntentForRow(row);
   }
 
   // Crash between sign and send: the stored envelope resubmits byte-for-byte,
@@ -907,15 +1009,16 @@ async function bumpRow(
       // Expected after the inner already landed; poll before deciding.
       const recheck = await server.getTransaction(row.hash!);
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
+        const recheckLedger = (recheck as { ledger?: number }).ledger ?? null;
         const value = recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined;
         await completeOutboxRow(
           row,
-          { status: recheck.status, value, txHash: row.hash },
+          { status: recheck.status, value, txHash: row.hash, ledger: recheckLedger },
           {
             transition: {
               from: [...IN_FLIGHT],
               to: recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED',
-              patch: { landedHash: row.hash },
+              patch: { landedHash: row.hash, ledger: recheckLedger },
             },
             landedHash: recheck.status === 'SUCCESS' ? row.hash : null,
             store: useCustomStore ? store : undefined,

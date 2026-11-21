@@ -717,20 +717,26 @@ Cost: `/readyz` is polled every `HEALTH_CACHE_TTL_MS`. The outbox probe is one g
 
 The sync also writes `src/generated/contracts-manifest.json`: for each binding, a sha256 over its embedded spec entries, a per-entry `{ kind, name, sha256 }` index, and the expected wasm hash when the submodule's `deployments/*.json` records one (see `docs/contract-requests.md`). The manifest is derived from the submodule only — `--check` needs no network — so a binding bump shows up in code review as changed spec hashes.
 
-## Contract compatibility (#34)
+## Contract compatibility (#34, #322)
 
-The backend assumes the contracts at the `CONTRACTS` addresses run exactly the wasm the bindings were generated from. Deployed contracts can be upgraded, redeployed from another build, or replaced by an env override, and when they drift the failures appear late and far from the cause: a renamed entrypoint fails simulations with `MissingValue`, a changed struct decodes with missing fields, a changed event makes `Spec.parseEvent` return null or throw inside the indexer poll.
+The backend assumes the contracts at the `CONTRACTS` addresses run exactly the wasm the bindings were generated from. Although the contracts expose no in-place `update_current_contract_wasm` upgrade entrypoint, runtime drift still occurs in three ways:
+1. **Redeploy at the same ID:** Deterministic `--salt` deployments mean a testnet reset or redeploy from the same deployer and salt can replace the code behind an existing contract ID.
+2. **Rewiring to successors:** Treasury or resolver migrations deploy a successor contract and update `market-core` config (`Config.resolver`, `Config.treasury`), leaving `CONTRACTS.resolver` / `CONTRACTS.treasury` pointing at a retired contract.
+3. **Archival:** Contract instance or code ledger entries can become archived.
 
-Every deployed Soroban contract carries its interface: the wasm's `contractspecv0` custom section holds the same `ScSpecEntry` XDR the bindings embed, and the contract instance records its wasm hash. At boot, `src/services/stellar/spec-compat.ts`:
+Every deployed Soroban contract carries its interface: the wasm's `contractspecv0` custom section holds the same `ScSpecEntry` XDR the bindings embed, and the contract instance records its wasm hash. `src/services/stellar/spec-compat.ts` and `src/services/stellar/spec-monitor.ts`:
 
-- fetches each contract's instance and code ledger entries over RPC (`getLedgerEntries`), reads the wasm hash and parses the embedded spec (`contract.Spec.fromWasm`), cached per wasm hash;
-- diffs the deployed spec structurally against the synced binding — docs are ignored, types compare canonically (`Option`/`Vec`/`Map`/`BytesN`/UDT-by-name) — and classifies each difference as **breaking** or **compatible** against a usage table of the entrypoints the services actually call and the events the indexer projects (a unit test greps the services and fails when the table is stale);
-- checks the wasm hash against the manifest pin when one is recorded and the contract id is not overridden by env;
-- only confirms the USDC contract's executable is a Stellar Asset (its interface is a SAC, never checked).
+- batch-fetch all five contract instance ledger entries in one `getLedgerEntries` call (`fetchDeployedMany`), read wasm hashes, and parse embedded specs (`contract.Spec.fromWasm`), cached per wasm hash;
+- verify `market-core` wiring (`marketCoreConfig().resolver` and `.treasury` against `CONTRACTS`), recording any mismatch as a breaking `wiring` diff;
+- diff each deployed spec structurally against the synced binding — docs are ignored, types compare canonically (`Option`/`Vec`/`Map`/`BytesN`/UDT-by-name) — and classify each difference as **breaking** or **compatible** against a usage table of the entrypoints the services actually call and the events the indexer projects;
+- check the wasm hash against the manifest pin when one is recorded and the contract id is not overridden by env;
+- confirm the USDC contract's executable is a Stellar Asset.
 
-Classification rules: a used function removed or changed is breaking, an unused or new one is compatible; a struct/union/enum reachable from a used function or projected event is breaking when changed, except a union/enum case appended at the end, which is compatible for read-only types and breaking for types the backend encodes (e.g. `Category`); an error enum code reassigned under an existing name is breaking (error naming depends on it), new codes are compatible; a projected event changed in topics or data fields is breaking. A contract that cannot be verified (archived code entry, RPC failure) is breaking — the gate never fails open.
-
-In live mode (default `SPEC_COMPAT_ENFORCE=enforce`) any breaking difference or wasm-hash mismatch refuses startup, listing every breaking item. Dry-run (default `warn`) logs a structured warning and keeps running; `off` skips the check. The indexer keeps **storing** events whose spec changed in a breaking way but stops projecting and publishing them (and a `parseEvent` throw skips that event instead of aborting the poll). Admins can read the last report at `GET /api/v1/admin/chain/spec-compat`.
+**Runtime monitoring, classification & holds (#322):**
+- `startSpecMonitor()` re-runs the check every `SPEC_COMPAT_INTERVAL_MS` (default 10 min) under the `spec-compat` Postgres advisory lock (peer instances sync the latest `spec_compat_runs` row so `disabledEventProjections()` stays consistent across the cluster) and on suspicious runtime signals (`decodeEvent` failures, unknown `ContractError<n>` codes, and `MissingValue`/`WasmVm` simulation errors) debounced to `SPEC_COMPAT_MIN_GAP_MS` (default 60 s).
+- Each run is classified against the baseline report as `unchanged`, `compatible` (logged + `WARN` alert), `unverifiable` (retried with exponential backoff; only `SPEC_COMPAT_UNVERIFIABLE_RUNS` consecutive failures escalate to pause + `WARN` alert), or `breaking` (`CRITICAL` alert, keyed by `spec:<hash>`).
+- On breaking drift, affected scopes (`marketCore`/`treasury` → `TRADER, MARKET_MAKER`; `resolver`/`reasoningRegistry` → `MARKET_MAKER`; `wiring`/`usdc` → both) receive an `AgentControlHold` (`source: 'spec_drift'`, `ackRequired: true`) in `agent_control_holds`. Holds coexist with operator pauses without overwriting them while keeping `agent_controls` as the versioned summary row for `FOR SHARE` write checks.
+- `POST /api/v1/admin/agents/:agent/resume` refuses with `409 SPEC_DRIFT_UNACKED` while an unacknowledged or still-breaking `spec_drift` hold exists. Operators acknowledge drift via `POST /api/v1/admin/chain/spec-compat/ack` (`agents.manage` + step-up), which marks the hold acknowledged, re-runs the check, and releases the hold once the check passes.
 
 ## LLM router (#157)
 
@@ -1225,23 +1231,29 @@ attempt is `acquire()` → call → `record()`:
   RPM). An empty bucket makes `acquire` wait with jitter for up to 30 s.
 - **Circuit breaker** per provider: `closed → open → half-open`. A daily quota error
   opens it (Gemini: until at least the next UTC midnight); `LLM_BREAKER_FAILURE_THRESHOLD`
-  consecutive errors open it for `LLM_BREAKER_OPEN_MS`. After that exactly one probe
-  is admitted (its holder has a TTL, so a hung probe cannot block recovery);
-  success closes the breaker, failure reopens it. `LlmCircuitOpen` is `503
-  LLM_CIRCUIT_OPEN`; the router then tries the next provider.
-- **Daily budgets** per UTC day across providers and instances:
-  `LLM_DAILY_TOKEN_BUDGET` and `LLM_DAILY_COST_BUDGET_MICROS`. A call reserves
-  `ceil(chars/4) + maxTokens`; `record()` releases the reservation (also on errors
-  and responses without usage) and adds the real input/output tokens and an
-  estimated cost from `LLM_PRICES` (an estimate; update it when prices change).
-  Crashed calls are reclaimed when their lease TTL passes. Cron work stops at
-  `budget × (1 − LLM_ADMIN_RESERVE_PCT%)`; admin work runs to the full budget.
-  `LlmBudgetExceeded` is `429 LLM_BUDGET_EXCEEDED` and never falls back to another
-  provider (the budget is global). The market cycle logs `LLM_BUDGET_EXCEEDED`
-  once per day (Redis `SET NX`) and returns `null`.
+  consecutive errors open it for `LLM_BREAKER_OPEN_MS`. In `half-open`, one routine probe is
+  admitted (`probeHolder`), and if that slot is held by a non-`dispute` class, a `dispute` call
+  may take a second probe slot (`probeHolder2`) so routine probing never blocks a time-critical
+  dispute review (#327).
+- **LLM budget classes (#327)**: Each `CallContext` maps to one of six `PurposeClass`es via
+  `PURPOSE_CLASS` (`dispute_review → dispute`, `admin_* / eval → admin`, `market_generation → generation`,
+  `forecast → forecast`, `trace_hedge → hedge`, unknown → `other`). Each class has `{ guaranteePct, capPct, canBorrow, bucketReserve }`,
+  configurable via `LLM_CLASS_POLICY` (defaults: `dispute {15, 40, true, 2}`, `admin {10, 100, true, 1}`,
+  `generation {20, 50, true, 0}`, `forecast {20, 50, true, 0}`, `hedge {5, 20, true, 0}`, `other {0, 10, false, 0}`;
+  `LLM_ADMIN_RESERVE_PCT` is deprecated and maps onto `admin.guaranteePct`).
+  For daily budget `B` (`LLM_DAILY_TOKEN_BUDGET` and `LLM_DAILY_COST_BUDGET_MICROS`), class usage
+  `u_c = used_c + reserved_c`, total `U`, guarantee `g_c = floor(B · guaranteePct_c / 100)`,
+  cap `cap_c = floor(B · capPct_c / 100)`, and `heldBack = Σ_{d≠c} max(0, g_d − u_d)`:
+  1. Reject with `LlmBudgetExceeded` (`reason: 'CLASS_CAP'`) if `u_c + est > cap_c`.
+  2. Admit if `u_c + est ≤ g_c` and `U + est ≤ B` (within the class's guaranteed share).
+  3. Otherwise admit if `canBorrow` and `U + est ≤ B − heldBack` (borrowing never consumes another class's unused guarantee).
+  The day hash tracks `t:<class>`, `c:<class>`, and `r:<class>` alongside totals, and lease members
+  encode `leaseId|day|estimate|class` (with backwards-compatible reclamation of 3-part members).
+  `getLlmUsage()` exposes `{ total, byClass }` in `GET /admin/status`. Any `dispute` budget or rate-limit
+  rejection logs at `warn` and alerts via `AlertService`.
 - **Redis down**: `LLM_REDIS_FAIL_MODE=closed` (recommended) refuses calls with
   `LLM_CIRCUIT_OPEN` / `GUARD_STORE_UNAVAILABLE`; `open` falls back to a per-process
-  limiter and warns at most once a minute.
+  `MemoryGuardStore` and warns at most once a minute.
 
 Time comes from Redis `TIME` inside the scripts, so clock skew between instances
 does not matter; this is also why budgets reset at UTC midnight, unrelated to
@@ -1369,12 +1381,14 @@ The Socket.io server enforces connection security, buffer limits, and outbound t
 - **Connection caps:** Distributed per-IP and global caps are enforced atomically via Redis Lua scripts with local in-memory fallback. `SOCKET_IP_EXEMPT_CIDRS` allows operators to exempt specific NAT or monitoring ranges from per-IP connection limits.
 - **Outbound Throttling & Degraded Mode:** Sockets buffering beyond `SOCKET_SLOW_WARN_BYTES` are removed from the `realtime:full` room and only receive coalesced `MARKET_PRICE` ticks. Sockets buffering beyond `SOCKET_SLOW_DROP_BYTES` are disconnected to prevent heap exhaustion.
 
-## Chain read cache (#98)
+## Chain read cache (#98, #330)
 
-Simulations of live contract state (`get_market`, `state`, `available_capital`) are cached in Redis via `src/lib/chain-cache.ts`:
+Simulations of live contract state (`get_market`, `state`, `available_capital`) are cached in Redis via `src/lib/chain-cache.ts` (with an in-memory fallback):
 - **Lossless Codec:** Typed tagged representations preserve `bigint`, `Buffer`/`Uint8Array`, and tagged enum variants across round-trips.
-- **Tag Generation Invalidation:** Invalidation avoids key scans by incrementing generation counters (`chain:gen:<tag>`). Each cached entry records its tags' generations at read time.
-- **Ledger Invalidation & Single-Flight:** Invalidation tracks `chain:minLedger:<tag>`, ensuring simulation results read from older ledgers are never written back over fresher events. Cross-instance single-flight locks prevent stampeding RPC nodes during concurrent cache misses.
+- **Pre-Load Generation Capture & Atomic Store:** Tag generations (`chain:gen:<tag>`) are snapshotted *before* invoking the RPC loader. When storing, both the memory cache and Redis (`STORE_IF_GEN_LUA`) verify that generations have not changed, no write intent is active, and the loaded ledger meets or exceeds every tag's minimum ledger and any existing cached entry's ledger. An overlapping invalidation returns the value uncached (`genRaceRejects`, `staleRejects`) instead of overwriting fresh state.
+- **Monotonic Minimum Ledgers:** `invalidateTag` increments `chain:gen:<tag>` and advances `chain:minLedger:<tag>` atomically with a monotonic max (`INVALIDATE_TAG_LUA`), so late indexer events from older ledgers can never lower the floor.
+- **Write-Confirmation Invalidation & Write Intents:** Every backend write derives its affected tags through `src/services/stellar/write-tags.ts`. Once signed and before `sendTransaction`, `beginWrite` marks active write intents (`chain:intent:<tag>:<token>`, `chain:intentCount:<tag>`) for `OUTBOX_INLINE_WAIT_MS` plus margin (extended by outbox recovery while `PENDING`), causing concurrent readers to bypass the cache (`cached: false, intent: true`, `intentBypasses`). On confirmation (`SUCCESS`, or `FAILED` with a landed `txHash`), `outbox.onConfirmed` awaits `invalidateTag(tag, ledger)` on both the inline and recovery paths before `markHandled`, then clears the write intent (`endWrite`).
+- **Validated Single-Flight & Degraded Recovery:** Cross-instance lock waiters validate entries against current tag generations, minimum ledgers, and intents before serving, and reload directly (`waiterReloads`) if `CHAIN_CACHE_WAIT_MS` elapses. Lock release uses compare-and-delete (`UNLOCK_LUA`). If `invalidateTag` falls back to memory while Redis is unreachable, `degradedSince` invalidates any Redis entry with `readAt < degradedSince` once connectivity resumes. Cache counters are exposed in `GET /admin/status` under `chain.cache`.
 
 ## HTTP Caching & Conditional Requests (#99)
 

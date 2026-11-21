@@ -837,7 +837,7 @@ export async function getTracWithAccessControl(
     onChainTraceId:      trace.onChainTraceId,
     createdAt:           trace.createdAt,
     accessLevel:         'FREE_PREVIEW',
-    lockedFields:        ['fullSources', 'hedgeConditions', 'betFraction', 'betSizeUsdc', 'provenance.llm', 'provenance.generator'],
+    lockedFields:        ['fullSources', 'hedgeConditions', 'hedgePredicates', 'betFraction', 'betSizeUsdc', 'provenance.llm', 'provenance.generator'],
     unlockPriceRaw:      isDiscovered ? discovered.amountRaw : null,
     unlockPrice:         isDiscovered ? discovered.amountUsdc : null,
     unlockPriceStatus:   discovered.status,

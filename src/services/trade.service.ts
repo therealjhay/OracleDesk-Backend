@@ -14,6 +14,13 @@ import { isPermanentFailure } from './stellar/failures';
 import { registerHandler, type ChainTransactionRow, type CompletionContext, type CompletionOutcome } from './stellar/outbox';
 import { Prisma } from '@prisma/client';
 import { enqueueTracePublication } from './trace-publish.service';
+import { attachTracePredicatesToPosition } from './hedge-predicate.service';
+import {
+  classifyLiquidityBucket,
+  markExecutionReportOutcome,
+  recordExecutionQuoteAttempt,
+} from './execution-quality.service';
+import { priceYesBps } from '../generated/fpmm';
 import { tradeTraceAction } from '../lib/trace-actions';
 import {
   bigintToDecimalString,
@@ -62,8 +69,12 @@ export async function applyBuySuccess(
   tradeId: string,
   fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null },
   db: Prisma.TransactionClient | typeof prisma = prisma,
+  afterCommit?: (fn: () => Promise<void> | void) => void,
 ): Promise<void> {
-  const trade = await db.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, direction: true, amount: true } });
+  const trade = await db.trade.findUnique({
+    where: { id: tradeId },
+    select: { id: true, marketId: true, traceId: true, direction: true, amount: true },
+  });
   if (!trade) return;
 
   const fillPriceBps = priceBpsFromRaw(fill.collateralIn, fill.sharesOut);
@@ -85,10 +96,11 @@ export async function applyBuySuccess(
   const existingPos = await db.position.findUnique({ where: { tradeId: trade.id }, select: { id: true } });
   if (existingPos) return;
   try {
-    await db.position.create({
+    const position = await db.position.create({
       data: {
         marketId: trade.marketId,
         tradeId: trade.id,
+        traceId: trade.traceId,
         direction: trade.direction,
         status: 'OPEN',
         entryPrice: effectivePrice,
@@ -101,6 +113,14 @@ export async function applyBuySuccess(
         feesPaidRaw: bigintToDecimalString(fill.feeRaw),
       },
     });
+    if (trade.traceId) {
+      const attach = () =>
+        attachTracePredicatesToPosition(position.id, trade.traceId!).catch((err) => {
+          logger.warn({ err, positionId: position.id, traceId: trade.traceId }, 'Failed to attach trace predicates to position');
+        });
+      if (afterCommit) afterCommit(attach);
+      else await attach();
+    }
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
   }
@@ -121,13 +141,22 @@ export async function handleTradeBuyOutcome(
   if (outcome.status !== 'SUCCESS') {
     // EXPIRED rows the worker resolves were abandoned mid-rebuild or after a
     // crash: the envelope never landed, so the trade definitively failed.
+    const errText = outcome.status === 'EXPIRED' ? 'expired unsubmitted' : (outcome.error ?? 'failed on-chain');
     await ctx.tx.trade.updateMany({
       where: { id: tradeId, status: 'PENDING' },
       data: {
         status: 'FAILED',
-        errorMessage: outcome.status === 'EXPIRED' ? 'expired unsubmitted' : (outcome.error ?? 'failed on-chain'),
+        errorMessage: errText,
       },
     });
+    const isSlippage = /SlippageExceeded/i.test(errText);
+    ctx.afterCommit(() =>
+      markExecutionReportOutcome({
+        tradeId,
+        status: isSlippage ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+        failureCode: isSlippage ? 'SlippageExceeded' : outcome.status,
+      }),
+    );
     return;
   }
 
@@ -142,6 +171,7 @@ export async function handleTradeBuyOutcome(
       innerTxHash: row.hash,
     },
     ctx.tx,
+    ctx.afterCommit,
   );
 }
 
@@ -191,6 +221,7 @@ export async function executeTrade(payload: TradePayload): Promise<{
   const trade = await prisma.trade.create({
     data: {
       marketId:      payload.marketId,
+      traceId:       payload.traceId ?? null,
       direction:     payload.direction,
       status:        'PENDING',
       amount:        payload.amount,
@@ -323,6 +354,12 @@ export async function executeTrade(payload: TradePayload): Promise<{
         await prisma.trade.update({
           where: { id: trade.id },
           data:  { status: 'FAILED', errorMessage: String(err) },
+        });
+        const isSlippage = contractError === 'SlippageExceeded' || /SlippageExceeded/i.test(String(err));
+        await markExecutionReportOutcome({
+          tradeId: trade.id,
+          status: isSlippage ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+          failureCode: isSlippage ? 'SlippageExceeded' : (contractError ?? failure ?? 'TRADE_FAILED'),
         });
         await logAgentAction(
           'TRADER',
@@ -497,6 +534,13 @@ async function submitTradeTransaction(
   // fee_bps is fixed at market creation; the fee is charged on collateral in.
   const onChain = await getOnChainMarket(market.onChainMarketId);
   const feeRaw = mulDivCeil(collateralIn, BigInt(onChain.fee_bps), 10_000n);
+  const reserveYes = BigInt(onChain.reserve_yes);
+  const reserveNo = BigInt(onChain.reserve_no);
+  const liquidityBucket = classifyLiquidityBucket(reserveYes, reserveNo);
+  const yesMidBps = reserveYes > 0n && reserveNo > 0n ? Number(priceYesBps(reserveYes, reserveNo)) : null;
+  const quoteMidBps = yesMidBps === null ? null : (payload.direction === 'YES' ? yesMidBps : 10_000 - yesMidBps);
+  const decisionMidBps = priceToBps(payload.price);
+  let quoteAttempt = 0;
 
   logger.info(
     {
@@ -554,6 +598,26 @@ async function submitTradeTransaction(
         });
       }
       const minSharesOut = (quoted * (10_000n - AGENT_SLIPPAGE_BPS)) / 10_000n;
+      if (attemptId) {
+        quoteAttempt++;
+        await recordExecutionQuoteAttempt({
+          kind: 'BUY',
+          tradeId: attemptId,
+          marketId: market.id,
+          direction: payload.direction,
+          decisionMidBps,
+          slippageBoundBps: Number(AGENT_SLIPPAGE_BPS),
+          liquidityBucket,
+          quote: {
+            attempt: quoteAttempt + rebuildCount * 100,
+            quotedAt: new Date().toISOString(),
+            quoteMidBps,
+            quotedOutRaw: quoted.toString(),
+            boundRaw: minSharesOut.toString(),
+            quotedPriceBps: quoted > 0n ? Number((collateralIn * 10_000n) / quoted) : null,
+          },
+        });
+      }
       return {
         market_id: market.onChainMarketId!,
         outcome,
@@ -563,6 +627,7 @@ async function submitTradeTransaction(
     },
     undefined,
     {
+      market_id: market.onChainMarketId!.toString(),
       collateral_in: collateralIn.toString(),
       feeRaw: feeRaw.toString(),
       ...(attemptId ? { attemptId } : {}),
@@ -570,6 +635,13 @@ async function submitTradeTransaction(
     },
     attemptId ? { kind: 'trade.buy', refId: attemptId } : undefined,
   );
+  if (attemptId && result.txHash) {
+    await markExecutionReportOutcome({
+      tradeId: attemptId,
+      status: 'PENDING',
+      landedTxHash: result.txHash,
+    });
+  }
   return {
     txHash: result.txHash,
     dryRun: result.mode === 'dry-run',

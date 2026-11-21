@@ -24,7 +24,10 @@ import { logger } from '../lib/logger';
 import { agentClients, agentSigner, readClients } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
 import {
+  beginWriteIntentForRow,
   completeOutboxRow,
+  endWriteIntentForRow,
+  onConfirmed,
   parseReturnValue,
   prismaOutboxStore,
   runCompletionHandler,
@@ -52,11 +55,11 @@ import type {
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { PriceConfig, ResolutionState, SignerConfig } from '../generated/resolver';
-import { getRedis } from '../lib/redis';
 import {
   chainKey,
+  getChainCache,
   memoryChainCache,
-  redisChainCache,
+  setChainCache,
   type ChainCache,
   type CacheEntry,
 } from '../lib/chain-cache';
@@ -69,7 +72,7 @@ import {
   type AgentScope,
 } from './agent-controls.service';
 
-export { memoryChainCache };
+export { getChainCache, memoryChainCache, setChainCache };
 
 import { Keypair, scValToNative } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
@@ -142,23 +145,6 @@ async function crashPoint(p: CrashPoint): Promise<void> {
 }
 
 // ─── Cache Management ───────────────────────────────────────────────────────
-
-let activeChainCache: ChainCache | null = null;
-
-export function getChainCache(): ChainCache {
-  if (!activeChainCache) {
-    try {
-      activeChainCache = redisChainCache(getRedis());
-    } catch {
-      activeChainCache = memoryChainCache();
-    }
-  }
-  return activeChainCache;
-}
-
-export function setChainCache(cache: ChainCache | null): void {
-  activeChainCache = cache;
-}
 
 export function chainCacheStats() {
   return getChainCache().stats();
@@ -307,7 +293,8 @@ async function write<T>(
   } catch (err) {
     // A refused write never reached the chain; it is not a chain failure.
     if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
-      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
+      const errDetail = err instanceof Error ? `${err.message} ${String((err as { details?: unknown }).details ?? '')}` : String(err);
+      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null, errDetail);
     }
     throw err;
   }
@@ -495,6 +482,10 @@ async function submitWrite<T>(
     if (signedRow) outboxRow = signedRow;
   }
 
+  // Register a write intent so concurrent cached readers bypass the cache
+  // while this write is in flight (#330).
+  await beginWriteIntentForRow(outboxRow.id, method, args);
+
   const sender = getTransactionSender();
   const reader = getTransactionReader();
 
@@ -519,6 +510,7 @@ async function submitWrite<T>(
         'CHAIN_SUBMISSION_TIMEOUT',
       );
     }
+    await endWriteIntentForRow(outboxRow.id);
     throw new ChainError(`${method} submission failed`, contractErrorName(contract, err), {
       method,
       cause: err instanceof Error ? err.message : String(err),
@@ -724,6 +716,10 @@ async function attemptWrite<T>(
         if (signedRow) outboxRow = signedRow;
         await crashPoint('after-signed');
 
+        // Register a write intent so concurrent cached readers bypass the cache
+        // while this write is in flight (#330).
+        await beginWriteIntentForRow(outboxRow.id, method, args);
+
         const sender = getTransactionSender();
         try {
           // Fence: a holder that lost its lock must never submit.
@@ -825,6 +821,7 @@ async function attemptWrite<T>(
           handledAt: new Date(),
         })
         .catch(() => undefined);
+      await endWriteIntentForRow((outboxRow as ChainTransactionRow).id);
     }
     throw err;
   }
@@ -855,6 +852,7 @@ async function acceptSend(
         handledAt: new Date(),
       })
       .catch(() => undefined);
+    await endWriteIntentForRow(row.id);
     throw new ChainWriteFailure(
       { ...failure, txHash: failure.txHash ?? txHash },
       new Error(`sendTransaction returned ERROR (${failure.txCode ?? failure.class})`),
@@ -989,6 +987,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
             handledAt: new Date(),
           })
           .catch(() => undefined);
+        await endWriteIntentForRow(outboxRow.id);
         throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
       }
 
@@ -1021,15 +1020,22 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   if (decision === 'FAILED') {
     await submissionRecord('FAILED');
     const errName = contractErrorName(contract, confirmedTx);
+    const failedLedger = (confirmedTx as any)?.ledger ?? null;
     // The live caller's error path stands in for the completion handler.
-    await store
+    const failedRow = await store
       .transition(outboxRow.id, ['SUBMITTED'], 'FAILED', {
         landedHash: finalHash,
-        ledger: (confirmedTx as any)?.ledger ?? null,
+        ledger: failedLedger,
         error: errName ?? 'failed on-chain',
         handledAt: new Date(),
       })
-      .catch(() => undefined);
+      .catch(() => null);
+    await onConfirmed(failedRow ?? { ...outboxRow, landedHash: finalHash, ledger: failedLedger }, {
+      status: 'FAILED',
+      txHash: finalHash,
+      ledger: failedLedger,
+      error: errName ?? 'failed on-chain',
+    });
     throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
   }
 
@@ -1059,43 +1065,35 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   const chainValue = parseReturnValue({ contract, method }, (confirmedTx as any)?.returnValue);
   const value = (chainValue ?? simulatedValueFromSent<T>(contract, method, c.simulated)) as T;
 
-  const invalidateCache = () => {
-    try {
-      const cache = getChainCache();
-      if (method === 'agent_create_market') {
-        cache.invalidateTag('treasury:capital').catch(() => {});
-      } else if (method === 'agent_buy' || method === 'agent_sell') {
-        const mId = args.market_id !== undefined ? String(args.market_id) : null;
-        if (mId) cache.invalidateTag(`market:${mId}`).catch(() => {});
-        cache.invalidateTag('treasury:capital').catch(() => {});
-      }
-    } catch {}
-  };
-
+  const confirmedLedger = (confirmedTx as any)?.ledger ?? null;
   const successRow = await completeOutboxRow(
     outboxRow,
-    { status: 'SUCCESS', value, txHash: finalHash },
+    { status: 'SUCCESS', value, txHash: finalHash, ledger: confirmedLedger },
     {
       transition: {
         from: ['SUBMITTED', 'PENDING'],
         to: 'SUCCESS',
         patch: {
           landedHash: finalHash,
-          ledger: (confirmedTx as any)?.ledger ?? null,
+          ledger: confirmedLedger,
           returnValue: printable(value) as object,
         },
       },
       landedHash: finalHash,
-      afterCommit: invalidateCache,
     },
   ).catch((err) => {
     logger.error({ err, outboxId: outboxRow.id, kind: outboxRow.kind }, 'completion handler failed; recovery will retry');
-    // Still invalidate cache if the row itself was already committed elsewhere.
-    invalidateCache();
     return null;
   });
   if (successRow) {
     outboxRow = successRow;
+  } else {
+    await onConfirmed({ ...outboxRow, landedHash: finalHash, ledger: confirmedLedger }, {
+      status: 'SUCCESS',
+      value,
+      txHash: finalHash,
+      ledger: confirmedLedger,
+    });
   }
 
   logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
@@ -1358,8 +1356,12 @@ const agentBuyImpl = (
   ref?: WriteRef,
 ) => {
   const resolver = typeof args === 'function' ? args : async () => args;
-  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', { ...(typeof args === 'function' ? {} : args), ...meta }, async (opts, signer) =>
-    agentClients.treasury(signer).agent_buy(await resolver(), opts as any), signal, ref);
+  const trackedArgs: Record<string, unknown> = { ...(typeof args === 'function' ? {} : args), ...meta };
+  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', trackedArgs, async (opts, signer) => {
+    const resolved = await resolver();
+    if (trackedArgs.market_id === undefined) trackedArgs.market_id = resolved.market_id;
+    return agentClients.treasury(signer).agent_buy(resolved, opts as any);
+  }, signal, ref);
 };
 
 const agentSellImpl = (

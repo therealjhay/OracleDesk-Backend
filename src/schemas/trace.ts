@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  HedgePredicateSchema,
+  MAX_HEDGE_PREDICATES,
+  type HedgePredicate,
+} from './hedge-predicate';
 
 // z.guid(), not z.uuid(): zod 4's uuid() also checks RFC 9562 version and
 // variant bits, which the published JSON Schema (`format: uuid`) and zod 3
@@ -147,6 +152,8 @@ export const TraceDocV2 = TraceDocV1.extend({
     })
     .strict()
     .nullable(),
+  /** Machine-checkable hedge predicates (#302). Null on older traces. */
+  hedgePredicates: z.array(HedgePredicateSchema).max(MAX_HEDGE_PREDICATES).nullable().optional(),
 }).strict();
 export type TraceDocV2 = z.infer<typeof TraceDocV2>;
 
@@ -249,6 +256,7 @@ export function buildTraceDoc(params: {
   betFraction?: number | null;
   betSizeUsdc?: number | null;
   hedgeConditions?: string[] | null;
+  hedgePredicates?: HedgePredicate[] | null;
   agentWallet?: string | null;
   createdAt?: string | Date;
 }): TraceDocV1 {
@@ -371,6 +379,7 @@ export interface TraceDocV2Params {
   betFraction?: number | null;
   betSizeUsdc?: number | null;
   hedgeConditions?: string[] | null;
+  hedgePredicates?: HedgePredicate[] | null;
   agentWallet?: string | null;
   forecast?: Record<string, unknown> | null;
   sizing?: Record<string, unknown> | null;
@@ -444,6 +453,9 @@ export function buildTraceDocV2(params: TraceDocV2Params, now: Date): TraceDocV2
           units: params.corroboration.units,
           domains: [...params.corroboration.domains].sort().slice(0, 50),
         }
+      : null,
+    hedgePredicates: params.hedgePredicates
+      ? params.hedgePredicates.slice(0, MAX_HEDGE_PREDICATES)
       : null,
   };
 

@@ -6,8 +6,17 @@
  *   npm run verify:report -- --date 2026-10-14 [--rpc URL] [--gateway URL]
  */
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { rpc } from '@stellar/stellar-sdk';
 import { traceAttestationMessage, verifyTraceSignatureLocal } from '../src/lib/trace-signing';
+import { canonicalJson, sha256Hex } from '../src/utils/hash.util';
+import { buildReportForDate } from '../src/services/transparency-report.service';
+import {
+  createFixtureReportChainReader,
+  createLiveReportChainReader,
+  type RecordedReportFixture,
+  type ReportChainReader,
+} from '../src/services/report-chain-reader';
 import { Client as RegistryClient } from '../src/generated/reasoning-registry';
 import { Client as TreasuryClient } from '../src/generated/treasury';
 import deployments from '../src/generated/deployments.testnet.json';
@@ -21,6 +30,9 @@ export interface VerifyOptions {
   gatewayUrl?: string;
   networkPassphrase?: string;
   contracts?: { reasoningRegistry?: string; treasury?: string };
+  rebuild?: boolean;
+  fixturePath?: string;
+  reader?: ReportChainReader;
   /** Test seam for unit tests; the CLI never passes this. */
   deps?: {
     registry?: any;
@@ -196,6 +208,21 @@ export async function verify(opts: VerifyOptions = {}): Promise<VerifyResult> {
     add('state_moved_since_anchor', true, `state moved ${latest.sequence - report.anchor.ledger} ledgers; re-simulation is advisory`);
   }
 
+  if (opts.rebuild) {
+    const reportDate = opts.date ?? String(report.period?.from ?? '').slice(0, 10);
+    try {
+      const reader = opts.reader
+        ?? (opts.fixturePath
+          ? createFixtureReportChainReader(JSON.parse(fs.readFileSync(opts.fixturePath, 'utf8')) as RecordedReportFixture)
+          : createLiveReportChainReader());
+      const rebuilt = await buildReportForDate(reportDate, { reader });
+      const rebuiltHash = sha256Hex(canonicalJson(rebuilt));
+      add('rebuild_byte_identical', rebuiltHash === computedHash, `${rebuiltHash} vs ${computedHash}`);
+    } catch (err) {
+      add('rebuild_byte_identical', false, err instanceof Error ? err.message : String(err));
+    }
+  }
+
   return {
     ok: checks.every((c) => c.ok),
     traceId: traceId.toString(),
@@ -212,10 +239,17 @@ function arg(name: string): string | undefined {
 
 if (require.main === module) {
   if (process.argv.includes('--help')) {
-    console.log('Usage: npm run verify:report -- --date YYYY-MM-DD [--rpc URL] [--gateway URL] [--trace-id ID]');
+    console.log('Usage: npm run verify:report -- --date YYYY-MM-DD [--rpc URL] [--gateway URL] [--trace-id ID] [--rebuild] [--fixture PATH]');
     process.exit(0);
   }
-  verify({ date: arg('date'), traceId: arg('trace-id'), rpcUrl: arg('rpc'), gatewayUrl: arg('gateway') })
+  verify({
+    date: arg('date'),
+    traceId: arg('trace-id'),
+    rpcUrl: arg('rpc'),
+    gatewayUrl: arg('gateway'),
+    rebuild: process.argv.includes('--rebuild'),
+    fixturePath: arg('fixture'),
+  })
     .then((result) => {
       for (const check of result.checks) console.log(`${check.ok ? 'ok  ' : 'FAIL'} ${check.name}: ${check.detail}`);
       console.log(result.ok ? '\nreport verified' : '\nreport verification FAILED');

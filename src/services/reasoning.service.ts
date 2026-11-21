@@ -2,7 +2,11 @@ import { prisma } from '../lib/prisma';
 import { callLLMStructured } from '../lib/llm';
 import { LlmBudgetExceeded, type CallContext } from '../lib/llm-budget';
 import { traceReasoningSchema, traceReasoningSpec } from '../lib/llm-schema';
-import { hedgeConditionsV1 } from '../lib/prompts';
+import { hedgeConditionsV2 } from '../lib/prompts';
+import {
+  validateAndGroundPredicates,
+  type HedgePredicate,
+} from '../schemas/hedge-predicate';
 import { buildTraceProvenance, type ProvenanceEntry } from '../lib/llm/provenance';
 import { renderUntrustedBlock, sanitizeSignal } from './llm-guard.service';
 import { logger } from '../lib/logger';
@@ -77,6 +81,7 @@ export async function generateReasoningTrace(
     // #223: which source weight set scored the evidence; absent on older traces.
     sourceWeightSet:     input.sourceWeightSet,
     hedgeConditions:     hedgeConditions.conditions,
+    hedgePredicates:     hedgeConditions.predicates,
     provenance,
     agentWallet:         input.agentWallet,
     timestamp:           clockNow().toISOString(),
@@ -104,6 +109,7 @@ export async function generateReasoningTrace(
       betFraction:         input.betFraction ?? null,
       betSizeUsdc:         input.betSizeUsdc ?? null,
       hedgeConditions:     hedgeConditions.conditions as Prisma.InputJsonValue,
+      hedgePredicates:     hedgeConditions.predicates as unknown as Prisma.InputJsonValue,
       provenance:          provenance as unknown as Prisma.InputJsonValue,
       agentWallet:         input.agentWallet,
       sourceWeightSetVersion: input.sourceWeightSet?.version ?? null,
@@ -207,6 +213,8 @@ async function generateHedgeConditions(
   ctx:   CallContext,
 ): Promise<{
   conditions: string[];
+  predicates: HedgePredicate[];
+  droppedPredicates: number;
   reasoning: string;
   provenance: ProvenanceEntry;
 }> {
@@ -219,7 +227,7 @@ async function generateHedgeConditions(
     id: `s${i + 1}`,
   }));
 
-  const { system, user } = hedgeConditionsV1.render({
+  const { system, user } = hedgeConditionsV2.render({
     marketId: input.marketId,
     agentType: input.agentType,
     decisionType: input.decisionType,
@@ -237,12 +245,14 @@ async function generateHedgeConditions(
       `Close if primary signal source reverses direction`,
       `Hard stop-loss at 15% adverse market move`,
     ],
+    predicates: [] as HedgePredicate[],
+    droppedPredicates: 0,
     reasoning: 'Default hedge conditions applied — LLM call failed',
     // No model produced these: marked as such, with no model fields (#66).
     provenance: {
       source: 'default' as const,
-      promptId: hedgeConditionsV1.id,
-      promptVersion: hedgeConditionsV1.version,
+      promptId: hedgeConditionsV2.id,
+      promptVersion: hedgeConditionsV2.version,
       reason,
     },
   });
@@ -255,12 +265,21 @@ async function generateHedgeConditions(
         maxTokens: 1024,
         ctx,
         task: 'hedge_conditions',
-        prompt: { id: hedgeConditionsV1.id, version: hedgeConditionsV1.version, hash: hedgeConditionsV1.contentHash },
+        prompt: { id: hedgeConditionsV2.id, version: hedgeConditionsV2.version, hash: hedgeConditionsV2.contentHash },
       },
     );
     const validated = result.value;
+    const grounded = validateAndGroundPredicates(validated.hedge_predicates);
+    if (grounded.droppedCount > 0) {
+      logger.warn(
+        { marketId: input.marketId, droppedCount: grounded.droppedCount, droppedReasons: grounded.droppedReasons },
+        'Dropped ungrounded hedge predicates from LLM output',
+      );
+    }
     return {
       conditions: validated.hedge_conditions,
+      predicates: grounded.valid,
+      droppedPredicates: grounded.droppedCount,
       reasoning: validated.reasoning_summary,
       provenance: result.provenance,
     };

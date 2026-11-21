@@ -21,6 +21,7 @@ import { startPaymentIntentCron } from './cron/payment-intent.cron';
 import { startOpsAlertCron } from './cron/ops-alerts.cron';
 import { startEventListener } from './services/indexer.service';
 import { gateDecision, runSpecCompatGate } from './services/stellar/spec-compat';
+import { startSpecMonitor } from './services/stellar/spec-monitor';
 import { startOutboxWorker } from './services/stellar/outbox';
 import { getChannelPool } from './services/stellar/channels';
 import { resumeIncomplete } from './services/market-saga.service';
@@ -139,6 +140,7 @@ async function bootstrap(): Promise<void> {
   if (specCompat && gateDecision(specCompat, specCompat.mode) === 'refuse') {
     process.exit(1);
   }
+  stopSpecMonitor = startSpecMonitor();
 
   // 1c. Transaction outbox recovery (#35): resolve whatever a previous process
   // left in flight before the indexer and crons start issuing new writes, then
@@ -350,6 +352,8 @@ async function bootstrap(): Promise<void> {
 
   // ─── Shutdown coordinator registrations (#264) ───────────────────────────
   onShutdown('stop-intake', 'event-listener', async () => { stopEventListener?.(); }, 2_000);
+  onShutdown('stop-producers', 'crons', async () => { stopAllScheduledJobs(); }, 1_000);
+  onShutdown('stop-producers', 'spec-monitor', async () => { stopSpecMonitor?.(); }, 1_000);
   onShutdown('stop-producers', 'outbox-worker', async () => { stopOutboxWorker?.(); }, 3_000);
   onShutdown('stop-producers', 'fanout', async () => { if (stopFanout) await stopFanout(); }, 5_000);
   onShutdown('stop-producers', 'secret-refresh', async () => { stopSecretRefresh?.(); }, 1_000);

@@ -181,6 +181,54 @@ export async function runTraderPolicy(
 
   for (const position of openPositions) {
     signal?.throwIfAborted();
+    let closedByPredicate = false;
+
+    if (env.evaluatePredicates) {
+      const triggered = await env.evaluatePredicates(position, now, cycleId);
+      for (const hit of triggered) {
+        if (hit.predicate.action === 'EXIT' && !closedByPredicate) {
+          const exit = await env.exit(position.id, 'HEDGE_PREDICATE', position.currentPrice ?? position.entryPrice);
+          closedByPredicate = exit.ok;
+          await recordDecision({
+            kind: 'HEDGE_PREDICATE',
+            marketId: position.marketId,
+            reasonCode: 'HEDGE_PREDICATE_EXIT',
+            positionId: position.id,
+            outcome: { exited: exit.ok, ...(exit.reason ? { exitReason: exit.reason } : {}) },
+            data: {
+              positionId: position.id,
+              predicateId: hit.predicate.id,
+              predicate: hit.predicate,
+              evaluation: hit.evaluation,
+              exited: exit.ok,
+            },
+          });
+          logger.info({ positionId: position.id, predicateId: hit.predicate.id, exited: exit.ok }, 'Hedge predicate EXIT triggered');
+        } else if (hit.predicate.action === 'REFORECAST') {
+          const reforecasted = env.reforecast
+            ? await env.reforecast(position, now)
+            : { ok: false, reason: 'REFORECAST_UNSUPPORTED' };
+          await recordDecision({
+            kind: 'HEDGE_PREDICATE',
+            marketId: position.marketId,
+            reasonCode: 'HEDGE_PREDICATE_REFORECAST',
+            positionId: position.id,
+            outcome: reforecasted,
+            data: {
+              positionId: position.id,
+              predicateId: hit.predicate.id,
+              predicate: hit.predicate,
+              evaluation: hit.evaluation,
+              reforecasted,
+            },
+          });
+          logger.info({ positionId: position.id, predicateId: hit.predicate.id, reforecasted }, 'Hedge predicate REFORECAST triggered');
+        }
+      }
+    }
+
+    if (closedByPredicate) continue;
+
     const { shouldClose, reason } = await env.stopLoss(position);
     if (shouldClose && reason) {
       const exit = await env.exit(position.id, 'STOP_LOSS', position.currentPrice ?? position.entryPrice);

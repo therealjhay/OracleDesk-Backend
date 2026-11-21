@@ -167,6 +167,7 @@ enum AgentDecisionKind {
   BUY
   SKIP
   HEDGE
+  HEDGE_PREDICATE
   STOP_LOSS
   DRAWDOWN_PAUSE
   TREASURY_READ_FAILED
@@ -180,6 +181,8 @@ enum AgentDecisionReason {
   STOP_LOSS_TRIGGERED
   HEDGE_EXECUTED
   HEDGE_FAILED
+  HEDGE_PREDICATE_EXIT
+  HEDGE_PREDICATE_REFORECAST
   POSITION_ALREADY_OPEN
   MARKET_NOT_ON_CHAIN
   PRICE_STALE
@@ -381,6 +384,7 @@ model MarketGenerationRun {
 model Trade {
   id           String         @id @default(uuid())
   marketId     String
+  traceId      String?
   direction    TradeDirection
   status       TradeStatus    @default(PENDING)
   /// CHECK: trades_amount_nonneg (amount >= 0)
@@ -413,7 +417,8 @@ model Trade {
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market     Market      @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  market     Market          @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trace      ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
   position   Position?
   copyTrades CopyTrade[]
   agentDecisions AgentDecision[]
@@ -429,6 +434,7 @@ model Position {
   id           String         @id @default(uuid())
   marketId     String
   tradeId      String         @unique
+  traceId      String?
   direction    TradeDirection
   status       PositionStatus @default(OPEN)
   /// CHECK: positions_entry_price_range (entryPrice >= 0 AND entryPrice <= 1)
@@ -463,15 +469,42 @@ model Position {
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
 
-  market      Market  @relation(fields: [marketId], references: [id], onDelete: Cascade)
-  hedgeMarket Market? @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
-  trade       Trade   @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  market      Market          @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  hedgeMarket Market?         @relation("MarketHedgePositions", fields: [hedgeMarketId], references: [id], onDelete: SetNull)
+  trade       Trade           @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  trace       ReasoningTrace? @relation(fields: [traceId], references: [id], onDelete: SetNull)
   exits       PositionExit[]
   agentDecisions AgentDecision[]
+  predicates  PositionPredicate[]
 
   @@index([marketId])
   @@index([status])
   @@map("positions")
+}
+
+/// Machine-checkable hedge predicates attached to an open position (#302).
+model PositionPredicate {
+  id               String    @id @default(uuid())
+  positionId       String
+  traceId          String?
+  predicateId      String
+  kind             String
+  action           String
+  predicate        Json
+  /// ACTIVE | TRIGGERED | CANCELLED
+  status           String    @default("ACTIVE")
+  evaluatedAt      DateTime? @db.Timestamptz(3)
+  triggeredAt      DateTime? @db.Timestamptz(3)
+  triggerCycleId   String?
+  evaluationResult Json?
+  createdAt        DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @db.Timestamptz(3)
+
+  position Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@unique([positionId, predicateId])
+  @@index([status])
+  @@map("position_predicates")
 }
 
 /// One attempt to sell shares of a position through treasury.agent_sell (#77).
@@ -501,6 +534,49 @@ model PositionExit {
 
   @@index([positionId])
   @@map("position_exits")
+}
+
+/// Execution quality & implementation shortfall per agent buy/sell (#295).
+model ExecutionReport {
+  id                   String         @id @default(uuid())
+  /// BUY | SELL
+  kind                 String
+  tradeId              String?        @unique
+  positionExitId       String?        @unique
+  marketId             String
+  direction            TradeDirection
+  decisionLedger       Int?
+  decisionMidBps       Int?
+  slippageBoundBps     Int
+  /// Array of { attempt, quotedAt, quoteMidBps?, quotedOutRaw, boundRaw, quotedPriceBps }
+  quotes               Json           @default("[]")
+  quoteCount           Int            @default(0)
+  /// PENDING | CONFIRMED | SLIPPAGE_EXCEEDED | FAILED
+  status               String         @default("PENDING")
+  failureCode          String?
+  landedTxHash         String?
+  fillLedger           Int?
+  ledgerDelay          Int?
+  fillCollateralRaw    Decimal?       @db.Decimal(39, 0)
+  fillSharesRaw        Decimal?       @db.Decimal(39, 0)
+  fillFeeRaw           Decimal?       @db.Decimal(39, 0)
+  fillPriceBps         Int?
+  postReserveYesRaw    Decimal?       @db.Decimal(39, 0)
+  postReserveNoRaw     Decimal?       @db.Decimal(39, 0)
+  /// THIN | MEDIUM | DEEP | UNKNOWN
+  liquidityBucket      String?
+  delayBps             Int?
+  impactBps            Int?
+  feeBps               Int?
+  residualBps          Int?
+  totalShortfallBps    Int?
+  createdAt            DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@index([marketId, createdAt])
+  @@index([status, liquidityBucket])
+  @@index([landedTxHash])
+  @@map("execution_reports")
 }
 
 enum AgentControlScope {
@@ -560,6 +636,8 @@ model ReasoningTrace {
   betFraction         Float?
   betSizeUsdc         Float?
   hedgeConditions     Json?             // string[]
+  /// Machine-checkable hedge predicates (#302). Null on older traces.
+  hedgePredicates     Json?
   /// TraceProvenance embedded in the pinned payload (#66). Null for older traces.
   provenance          Json?
   agentWallet         String?
@@ -588,6 +666,8 @@ model ReasoningTrace {
   updatedAt           DateTime          @updatedAt
 
   market        Market         @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  trades        Trade[]
+  positions     Position[]
   copyTrades    CopyTrade[]
   agentDecisions AgentDecision[]
   subscriptions Subscription[]

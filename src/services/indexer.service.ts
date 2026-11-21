@@ -28,6 +28,7 @@ import { logger } from '../lib/logger';
 import { newId, runWithContext } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { disabledEventProjections } from './stellar/spec-compat';
+import { requestSpecCheck } from './stellar/spec-monitor';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
@@ -105,6 +106,7 @@ export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): Deco
       { contract: entry.name, eventId: event.id, err: err instanceof Error ? err.message : String(err) },
       'Indexer: event does not decode with the binding spec (skipped; see /admin/chain/spec-compat)',
     );
+    requestSpecCheck(`decode_failure:${entry.name}`);
     return null;
   }
   if (!parsed) return null;
@@ -169,6 +171,22 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
       }
       if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
         await cache.invalidateTag('treasury:capital', event.ledger);
+        if (event.txHash && p.collateral != null && p.shares != null && p.reserve_yes != null && p.reserve_no != null) {
+          const { recordExecutionFillFromEvent } = await import('./execution-quality.service');
+          await recordExecutionFillFromEvent({
+            txHash: event.txHash,
+            ledger: event.ledger,
+            isBuy: Boolean(p.is_buy),
+            outcome: String(p.outcome ?? 'Yes'),
+            collateral: BigInt(String(p.collateral)),
+            shares: BigInt(String(p.shares)),
+            fee: BigInt(String(p.fee ?? 0)),
+            reserveYes: BigInt(String(p.reserve_yes)),
+            reserveNo: BigInt(String(p.reserve_no)),
+          }).catch((err) => {
+            logger.warn({ err, txHash: event.txHash }, 'Execution quality fill recording failed');
+          });
+        }
       }
     } else if (event.contractName === 'resolver') {
       if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
